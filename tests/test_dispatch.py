@@ -31,12 +31,35 @@ class TestNormalizeArgv:
 
 
 class TestLauncherPopup:
-    def test_window_command_shape(self):
+    def test_window_command_prefers_terminal_env(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL", "kitty")
+        monkeypatch.setattr(app.shutil, "which", lambda n: f"/usr/bin/{n}")
         cmd = app._tui_window_command()
-        assert cmd[0].endswith("ghostty")
-        assert "--class=ghostty.icp" in cmd
-        assert "--title=icp" in cmd
-        assert cmd[-1] == "show"      # the inner invocation runs the browser
+        assert cmd[0] == "/usr/bin/kitty"          # $TERMINAL wins over PATH order
+        assert "--class=kitty.icp" in cmd and "--title=icp" in cmd
+        assert "-e" not in cmd                       # kitty runs the command bare
+        assert cmd[-2:] == ["/usr/bin/icp", "show"]
+
+    def test_window_command_ghostty_keeps_dash_e(self, monkeypatch):
+        monkeypatch.delenv("TERMINAL", raising=False)
+        monkeypatch.setattr(app.shutil, "which",
+                            lambda n: "/usr/bin/ghostty" if n == "ghostty" else None)
+        cmd = app._tui_window_command()
+        assert cmd[0] == "/usr/bin/ghostty"         # PATH fallback order: ghostty first
+        assert "--class=ghostty.icp" in cmd and "-e" in cmd
+
+    def test_window_command_unknown_terminal_bare(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL", "alacritty -T icp")
+        monkeypatch.setattr(app.shutil, "which",
+                            lambda n: {"alacritty": "/usr/bin/alacritty", "icp": "/usr/bin/icp"}.get(n))
+        cmd = app._tui_window_command()
+        # unknown terminal: extra TERMINAL args kept, no class/title flags assumed
+        assert cmd == ["/usr/bin/alacritty", "-T", "icp", "/usr/bin/icp", "show"]
+
+    def test_window_command_none_when_no_terminal(self, monkeypatch):
+        monkeypatch.delenv("TERMINAL", raising=False)
+        monkeypatch.setattr(app.shutil, "which", lambda n: None)
+        assert app._tui_window_command() is None
 
     def test_show_without_tty_spawns_window(self, monkeypatch):
         monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: False))

@@ -9,6 +9,7 @@ import argparse
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -536,20 +537,37 @@ def _normalize_argv(argv):
 
 
 def _tui_window_command():
-    """The command that opens the password browser in a floating terminal popup -
-    the same Ghostty + --class pattern as the other local popups (addies, psoco);
-    a Hyprland windowrule floats ghostty.icp centered."""
-    ghostty = shutil.which("ghostty") or "/snap/bin/ghostty"
+    """The command that opens the password browser in a floating terminal popup.
+    $TERMINAL wins (a name, optionally with args, e.g. TERMINAL='kitty --font-size 12');
+    otherwise the first of ghostty/kitty on PATH. ghostty/kitty get --class=<term>.icp
+    + --title=icp to match the Hyprland float windowrule (ghostty needs -e, kitty
+    runs the command bare); any other terminal is used as-is. Returns None when no
+    terminal is found at all."""
     icp = shutil.which("icp") or sys.argv[0]
-    return [ghostty, "--class=ghostty.icp", "--title=icp", "-e", icp, "show"]
+    candidates = filter(None, [os.environ.get("TERMINAL"), "ghostty", "kitty"])
+    for cand in candidates:
+        argv = shlex.split(cand)
+        exe = shutil.which(argv[0])
+        if not exe:
+            continue
+        name = os.path.basename(exe)
+        if name in ("ghostty", "kitty"):
+            tail = ["-e"] if name == "ghostty" else []
+            return [exe, f"--class={name}.icp", "--title=icp", *argv[1:], *tail, icp, "show"]
+        return [exe, *argv[1:], icp, "show"]
+    return None
 
 
 def _spawn_tui_window() -> int:
     """No terminal attached (rofi/launcher/keybind): open one with the browser.
     Inside the popup stdio is a tty, so the TUI runs there and this returns when
     the user closes it."""
+    cmd = _tui_window_command()
+    if cmd is None:
+        ui.err("no terminal for the browser popup (set $TERMINAL or install kitty/ghostty)")
+        return 1
     try:
-        return subprocess.run(_tui_window_command()).returncode
+        return subprocess.run(cmd).returncode
     except OSError as e:
         ui.err(f"cannot open a terminal window for the browser: {e}")
         return 1
