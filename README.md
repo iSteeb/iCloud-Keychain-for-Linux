@@ -66,8 +66,10 @@ icp show
 ```
 
 Opens a full-screen list - start typing to filter, **Enter** to reveal a password,
-**Ctrl+Y** to copy the highlighted entry's password to the clipboard, **Ctrl+O** to copy
-its current verification code, **Esc** to quit. Wi-Fi (AirPort) passwords are excluded.
+**Ctrl+P** to copy the highlighted entry's password to the clipboard, **Ctrl+U** to copy
+its username, **Ctrl+O** to copy
+its current verification code and then quit (fetching a code is the last step of a
+login workflow), **Esc** to quit. Wi-Fi (AirPort) passwords are excluded.
 Entries with a custom name in the Passwords app show `Name (website)`. Add a word to
 search directly, or `--plain` for plain text:
 
@@ -164,7 +166,7 @@ icp logout   sign out (use --wipe-device to also forget this device)
 ```
 
 `icp show` full-screen keys: type to filter, up/down move, **Enter** reveal,
-**Ctrl+Y** copy password, **Ctrl+O** copy verification code, **Esc** clear/quit.
+**Ctrl+P** copy password, **Ctrl+U** copy username, **Ctrl+O** copy verification code and quit, **Esc** clear/quit.
 
 `icp show <term>` flags:
 

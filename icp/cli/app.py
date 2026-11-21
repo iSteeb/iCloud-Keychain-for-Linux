@@ -7,6 +7,10 @@ Commands: login, show, sync, logout. `show` also folds in Hide My Email aliases.
 """
 import argparse
 import logging
+import os
+import re
+import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -332,6 +336,19 @@ def cmd_show(args) -> int:
     --plain, --show-passwords, or non-terminal stdout falls back to plain text (which also folds
     in aliases). Status to stderr, rows to stdout so the list stays pipe/grep-friendly.
     """
+    use_tui = (not args.plain and not args.query and not args.show_passwords
+               and not _has_credential_flags(args))
+    if use_tui and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        # Launched without a terminal (rofi run, a keybind, a .desktop launcher):
+        # open the browser in a floating terminal popup instead of dumping to
+        # a null stdout. Inside the popup stdio is a tty, so the TUI runs there.
+        # The vault is deliberately NOT loaded in this launcher process: the
+        # popup runs its own `icp show`, so loading it here would pay the
+        # Secret-Service round-trip + decrypt twice per popup - and a vault
+        # error would die invisibly on a null stderr instead of showing in
+        # the popup (which surfaces it on its own tty).
+        return _spawn_tui_window()
+
     from ..vault.store import load_vault
 
     try:
@@ -340,9 +357,7 @@ def cmd_show(args) -> int:
         ui.err(f"could not open the vault: {e}")
         return 1
 
-    use_tui = (not args.plain and not args.query and not args.show_passwords
-               and not _has_credential_flags(args)
-               and sys.stdin.isatty() and sys.stdout.isatty())
+    use_tui = use_tui and sys.stdin.isatty() and sys.stdout.isatty()
     if use_tui:
         try:
             return _run_tui(store)
@@ -382,7 +397,7 @@ def _credential_flags(store, args) -> int:
     if not creds:
         ui.err(f"no credentials match {args.query!r}")
         return 1
-    creds.sort(key=lambda c: (c.title.lower(), c.username.lower()))
+    _sort_credentials(creds)
     cred = _pick_credential(creds, sys.stdin.isatty())
     if cred is None:
         ui.err("no entry selected - aborting (use a more specific search term)")
@@ -469,7 +484,7 @@ def _show_plain(store, args) -> int:
         return 0
 
     if creds:
-        creds.sort(key=lambda c: (c.title.lower(), c.username.lower()))
+        _sort_credentials(creds)
         dom_w = min(max(len(c.display_name) for c in creds), 40)
         user_w = min(max(len(c.username) for c in creds), 40)
         for c in creds:
@@ -504,45 +519,191 @@ def _printable(s: str) -> str:
     return "".join(ch if ch.isprintable() else "." for ch in s)
 
 
+_COMMANDS = ("login", "show", "sync", "logout")
+
+
+def _normalize_argv(argv):
+    """`icp` == `icp show`, and `icp <query>` == `icp show <query>`: insert the
+    implicit `show` subcommand unless the first token already is a command (or a
+    global flag followed by one, e.g. `icp --anisette URL sync`)."""
+    if not argv:
+        return ["show"]
+    if argv[0] in _COMMANDS:
+        return list(argv)
+    if argv[0].startswith("-") and any(a in _COMMANDS for a in argv):
+        return list(argv)
+    return ["show", *argv]
+
+
+def _tui_window_command():
+    """The command that opens the password browser in a floating terminal popup -
+    the same Ghostty + --class pattern as the other local popups (addies, psoco);
+    a Hyprland windowrule floats ghostty.icp centered."""
+    ghostty = shutil.which("ghostty") or "/snap/bin/ghostty"
+    icp = shutil.which("icp") or sys.argv[0]
+    return [ghostty, "--class=ghostty.icp", "--title=icp", "-e", icp, "show"]
+
+
+def _spawn_tui_window() -> int:
+    """No terminal attached (rofi/launcher/keybind): open one with the browser.
+    Inside the popup stdio is a tty, so the TUI runs there and this returns when
+    the user closes it."""
+    try:
+        return subprocess.run(_tui_window_command()).returncode
+    except OSError as e:
+        ui.err(f"cannot open a terminal window for the browser: {e}")
+        return 1
+
+
+def _sort_credentials(creds):
+    """Display order: logins with a verification code first (they're the ones you
+    need right now), then by title/username."""
+    creds.sort(key=lambda c: (not c.totp, c.title.lower(), c.username.lower()))
+    return creds
+
+
+def _psoco_flow(term: str | None = None) -> bool:
+    """Psono (work password store) lookup: search, pick, show and copy the password.
+
+    Replaces the old ~/.local/bin/psoco wrapper (invoked from rofi). `term` is
+    the TUI's current search query (the `?` key passes it straight through); when
+    None, the user is prompted. A single match is used immediately, several
+    prompt for an index. The password is printed AND copied - over ssh the copy
+    lands on the local machine's clipboard via OSC 52 (copy_to_clipboard's
+    fallback), and the mechanism is echoed so remote use is verifiable. Prints
+    to stdout and returns True when a search actually ran (the `?` key in
+    _run_tui suspends curses around this and holds the result until Enter)."""
+    psoco = shutil.which("psoco-cli") or os.path.expanduser("~/.local/bin/psoco-cli")
+    if not os.path.isfile(psoco):
+        ui.out(f"psoco-cli not found (looked on PATH and at {psoco})")
+        return False
+    term = term if term else ui.ask("psono search: ")
+    if not term:
+        return False
+
+    def fields(row: str) -> tuple[str, str]:
+        parts = [p.strip() for p in row.split("|")]
+        name = parts[1] if len(parts) > 1 else ""
+        entry_id = parts[3] if len(parts) > 3 else ""
+        return name, entry_id
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([psoco, *args], capture_output=True, text=True, timeout=30)
+
+    try:
+        proc = run("search", term)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        ui.out(f"psoco-cli failed to run: {e}")
+        return True
+    if proc.returncode != 0:
+        ui.out(f"psoco-cli search failed ({proc.returncode}): {proc.stderr.strip()}")
+        return True
+    rows = [l for l in proc.stdout.splitlines()
+            if "|" in l and not re.search(r"Name|---|\+", l)]
+    if not rows:
+        ui.out(f"No psono results for '{term}'.")
+        return True
+
+    if len(rows) == 1:
+        name, entry_id = fields(rows[0])
+    else:
+        ui.out("Multiple results - pick one:")
+        for i, row in enumerate(rows, 1):
+            ui.out(f"[{i}] {fields(row)[0]}")
+        pick = ui.ask(f"Number (1-{len(rows)}): ")
+        if not pick.isdigit() or not 1 <= int(pick) <= len(rows):
+            ui.out("Invalid selection.")
+            return True
+        name, entry_id = fields(rows[int(pick) - 1])
+    if not entry_id:
+        ui.out(f"Could not parse an entry id for '{name}' - psoco-cli table format changed?")
+        return True
+
+    try:
+        pwd = run("pwd", entry_id)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        ui.out(f"psoco-cli failed to run: {e}")
+        return True
+    if pwd.returncode != 0:
+        ui.out(f"psoco-cli pwd failed ({pwd.returncode}): {pwd.stderr.strip()}")
+        return True
+    password = pwd.stdout.strip()
+    if not password:
+        ui.out(f"No password returned for '{name}'.")
+        return True
+    try:
+        mechanism = copy_to_clipboard(password)
+        ui.out(f"psono password for {name}: {password}")
+        ui.out(f"(copied via {mechanism})")
+    except ClipboardError as e:
+        ui.out(f"psono password for {name}: {password}")
+        ui.err(f"copy failed: {e}")
+    return True
+
+
 def _run_tui(store) -> int:
-    """A very basic full-screen browser: status header, live-filter search box, and reveal a
-    selected password with Enter. Type to filter, up/down to move, Esc to clear the query (or quit
-    when it is empty)."""
+    """Full-screen password browser: one bordered panel (lazygit-style), cyan
+    accents, reverse-video selection with per-column attributes, a status line
+    for copy feedback, and a key-hint bar. Type to filter, up/down to move,
+    Enter to reveal a password, Ctrl+P to copy it, Ctrl+U to copy the username,
+    Ctrl+O to copy the current verification code and quit (the last step of a
+    login workflow). Esc to clear the query (or quit when it is empty); '/'
+    does the same clearing without the quit ('?' opens the psono lookup)."""
     import curses
 
-    creds = sorted(store.all(), key=lambda c: (c.title.lower(), c.username.lower()))
-    dom_w = min(max((len(c.display_name) for c in creds), default=6), 32)
-    user_w = min(max((len(c.username) for c in creds), default=4), 32)
-    summary = _printable(f"{_status_summary()}  |  {len(creds)} credential(s)")
-    footer = ("type to search | up/down move | Enter reveal | Ctrl+Y copy pw | "
-              "Ctrl+O copy code | Esc clear/quit")
+    creds = _sort_credentials(list(store.all()))
 
     def draw(stdscr):
         curses.curs_set(0)
         stdscr.keypad(True)
         stdscr.timeout(1000)  # redraw every second so the code countdowns tick
 
-        def put(y, x, s, attr=curses.A_NORMAL):
-            # addnstr raises curses.error on the bottom-right cell and other edges; a draw glitch
-            # must never tear the whole TUI down (that drops everything back to the console).
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)    # accent: title, borders
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)  # verification codes
+            curses.init_pair(3, curses.COLOR_GREEN, -1)   # copy confirmations
+        ACCENT = curses.color_pair(1) | curses.A_BOLD
+        BORDER = curses.color_pair(1)
+        CODE = curses.color_pair(2) | curses.A_BOLD
+        OK = curses.color_pair(3) | curses.A_BOLD
+
+        def put(y, x, s, attr=curses.A_NORMAL, width=None):
+            # addnstr raises on the bottom-right cell and screen edges; a draw
+            # glitch must never tear the whole TUI down.
             try:
-                stdscr.addnstr(y, x, s, max(0, w - 1 - x), attr)
+                stdscr.addnstr(y, x, s,
+                               width if width is not None else max(0, w - 1 - x), attr)
             except curses.error:
                 pass
 
         query, sel, offset, revealed = "", 0, 0, set()
-        flash = ["", 0.0]   # [message, visible-until unix time]
+        flash = ["", 0.0, curses.A_NORMAL]   # message, visible-until, attribute
 
-        def flash_copy(kind: str) -> None:
-            """Copy the selected entry's password ("password") or current verification
-            code ("code") and flash a confirmation on the line above the footer."""
+        def flash_copy(kind: str) -> bool:
+            """Copy the selected entry's password ("password"), username ("username")
+            or current verification code ("code") and show a confirmation on the
+            status line. Returns True when something was actually copied."""
             if not shown:
-                return
+                return False
             c = shown[sel]
+            copied = False
             try:
                 if kind == "password":
-                    copy_to_clipboard(c.password)
-                    flash[0] = f"password for {c.title or c.domain} copied to clipboard"
+                    if not c.password:
+                        flash[0] = "no password stored"
+                    else:
+                        copy_to_clipboard(c.password)
+                        flash[0] = f"password for {c.title or c.domain} copied to clipboard"
+                        copied = True
+                elif kind == "username":
+                    if not c.username:
+                        flash[0] = "no username stored"
+                    else:
+                        copy_to_clipboard(c.username)
+                        flash[0] = f"username for {c.title or c.domain} ({c.username}) copied to clipboard"
+                        copied = True
                 else:
                     code = totp_generate(c.totp)
                     if not code:
@@ -551,43 +712,106 @@ def _run_tui(store) -> int:
                         copy_to_clipboard(code["code"])
                         left = max(0, int(code["expires"] - time.time()))
                         flash[0] = f"code {code['code']} copied ({left}s left)"
+                        copied = True
+                flash[2] = OK
             except ClipboardError as e:
                 flash[0] = str(e)
+                flash[2] = curses.A_BOLD
             flash[1] = time.time() + 2.5
+            return copied
 
         while True:
             shown = [c for c in creds if _match(c, query.lower())]
             sel = max(0, min(sel, len(shown) - 1))
             h, w = stdscr.getmaxyx()
-            view_h = max(1, h - 5)  # rows 3..h-3 for credentials; h-2 flash line; h-1 footer
+
+            # -- layout: name, username, password, code columns; shrink to fit --
+            footer = " type to search   ↑↓ move   ⏎ reveal   ^P copy pw   ^U copy user   ^O code+quit   / clear   ? psono "
+            name_w = min(max((len(c.display_name) for c in creds), default=10), 38)
+            user_w = min(max((len(c.username) for c in creds), default=4), 28)
+            over = (2 + name_w + 2 + user_w + 2 + 8 + 2 + 13) - (w - 2)
+            if over > 0:
+                name_w = max(12, name_w - over)
+            user_x = 2 + name_w + 2
+            pw_x = user_x + user_w + 2
+            otp_x = pw_x + 8 + 2
+            rows_h = max(1, h - 6)   # entry rows sit between the two ├┤ joins
             if sel < offset:
                 offset = sel
-            elif sel >= offset + view_h:
-                offset = sel - view_h + 1
+            elif sel >= offset + rows_h:
+                offset = sel - rows_h + 1
 
+            # -- panel frame ---------------------------------------------
             stdscr.erase()
-            put(0, 0, summary, curses.A_BOLD)
-            put(1, 0, _printable(f"Search: {query}"))
+            put(0, 0, "┌" + "─" * (w - 2) + "┐", BORDER)
+            put(h - 1, 0, "└" + "─" * (w - 2) + "┘", BORDER)
+            put(2, 0, "├" + "─" * (w - 2) + "┤", BORDER)
+            put(h - 4, 0, "├" + "─" * (w - 2) + "┤", BORDER)
+            for y in range(1, h - 1):
+                put(y, 0, "│", BORDER)
+                put(y, w - 1, "│", BORDER)
+            title = f" iCloud Passwords · {len(creds)} logins"
+            if query:
+                title += f" · {len(shown)} match{'es' if len(shown) != 1 else ''}"
+            put(0, 4, title + " ", ACCENT)
+
+            # -- search line ---------------------------------------------
+            put(1, 2, "search:", BORDER)
+            put(1, 10, query if query else "(type to filter)",
+                curses.A_BOLD if query else curses.A_DIM)
+
+            # -- entries --------------------------------------------------
             if not shown:
-                put(3, 0, "(no matching credentials)", curses.A_DIM)
-            for idx, c in enumerate(shown[offset:offset + view_h]):
+                put(3, 4, "(no matching credentials)", curses.A_DIM)
+            for idx, c in enumerate(shown[offset:offset + rows_h]):
                 i = offset + idx
-                pw = c.password if id(c) in revealed else "******"
-                line = _printable(
-                    f"{c.display_name:<{dom_w}}  {c.username:<{user_w}}  {pw}{_totp_suffix(c)}")
-                put(3 + idx, 0, line, curses.A_REVERSE if i == sel else curses.A_NORMAL)
-            put(h - 2, 0, flash[0] if time.time() < flash[1] else "", curses.A_BOLD)
-            put(h - 1, 0, footer, curses.A_DIM)
+                y = 3 + idx
+                sel_attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
+                put(y, 1, " " * (w - 2), sel_attr)      # full-width selection strip
+                put(y, 2, _printable(c.display_name)[:name_w].ljust(name_w),
+                    sel_attr | (curses.A_BOLD if i == sel else curses.A_NORMAL))
+                put(y, user_x, _printable(c.username)[:user_w].ljust(user_w),
+                    sel_attr | curses.A_DIM)
+                pw = c.password if id(c) in revealed else "••••••"
+                pw_attr = curses.A_BOLD if id(c) in revealed else curses.A_DIM
+                put(y, pw_x, _printable(pw)[:8], sel_attr | pw_attr)
+                code = totp_generate(c.totp)
+                if code:
+                    left = max(0, int(code["expires"] - time.time()))
+                    put(y, otp_x, f"{code['code']} ({left}s)", sel_attr | CODE)
+
+            # -- status line + key hints ----------------------------------
+            if flash[0] and time.time() < flash[1]:
+                put(h - 3, 2, flash[0][:w - 4], flash[2])
+            else:
+                flash[0] = ""
+                put(h - 3, 2, f"{len(creds)} logins · / clears the search", curses.A_DIM)
+            put(h - 2, 2, footer, curses.A_DIM)
             stdscr.refresh()
 
             ch = stdscr.getch()
             if ch == -1:  # timeout: just redraw
                 continue
-            if ch == 27:  # Esc: clear the query, or quit when it is already empty
+            if ch == 27:  # Esc: clear the query, or quit when it is already empty.
+                # (In the kitty popup Esc never arrives here - the terminal maps
+                # it to close-window; use '/' to clear instead.)
                 if query:
                     query, sel, offset = "", 0, 0
                 else:
                     return 0
+            elif ch == ord("/"):  # '/': clear the search query
+                query, sel, offset = "", 0, 0
+            elif ch == ord("?"):  # '?': psono lookup of the CURRENT query, TUI suspended
+                curses.endwin()
+                try:
+                    if _psoco_flow(query or None):
+                        ui.ask("\n[press Enter to return]")
+                finally:
+                    stdscr.keypad(True)
+                    stdscr.timeout(1000)
+                    curses.curs_set(0)
+                    stdscr.refresh()
+                continue
             elif ch == curses.KEY_UP:
                 sel = max(0, sel - 1)
             elif ch == curses.KEY_DOWN:
@@ -595,10 +819,15 @@ def _run_tui(store) -> int:
             elif ch in (curses.KEY_ENTER, 10, 13):
                 if shown:
                     revealed ^= {id(shown[sel])}
-            elif ch == 25:  # Ctrl+Y: copy the selected entry's password
+            elif ch == 16:  # Ctrl+P: copy the selected entry's password
                 flash_copy("password")
-            elif ch == 15:  # Ctrl+O: copy the selected entry's current verification code
-                flash_copy("code")
+            elif ch == 21:  # Ctrl+U: copy the selected entry's username
+                flash_copy("username")
+            elif ch == 15:  # Ctrl+O: copy the current verification code, then quit -
+                # fetching a code is the last step of a login workflow, so the
+                # browser closes itself once it is safely on the clipboard.
+                if flash_copy("code"):
+                    return 0
             elif ch in (curses.KEY_BACKSPACE, 127, 8):
                 query, sel, offset = query[:-1], 0, 0
             elif 32 <= ch < 127:
@@ -836,6 +1065,8 @@ _ANISETTE_HELP = """anisette server (required by login/sync; `show` works withou
 
 def main(argv=None) -> int:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    if argv is None:
+        argv = sys.argv[1:]   # never let None reach _normalize_argv (it means "bare icp")
     p = argparse.ArgumentParser(
         prog="icp",
         description="iCloud Passwords for Linux - read-only iCloud Keychain access: "
@@ -843,14 +1074,68 @@ def main(argv=None) -> int:
                     "then browse/search/copy them from the command line.",
         epilog=_ANISETTE_HELP + """
 
+commands (bare `icp` is the same as `icp show`; launched without a terminal,
+  e.g. from rofi, the browser opens in a floating Ghostty popup - Hyprland rule
+  `ghostty.icp`):
+  icp login [-u APPLE_ID] [--save-password] [--debug]
+      Sign in (Apple ID + password + 2FA once), join the keychain via escrow
+      recovery, sync. The escrow step asks a device passcode and is IRREVERSIBLE
+      (~10 wrong passcodes destroy the escrow record; one correct entry is safe).
+        -u, --username APPLE_ID   Apple ID (prompted if omitted)
+        --save-password           keep the password in the encrypted session for
+                                  silent token refresh (default: not stored; re-run
+                                  `icp login` every ~2 months - password only)
+        --debug                   write a redacted debug transcript
+
+  icp show [query] [flags]
+      Browse/search the encrypted local vault - fully offline. No arguments in a
+      terminal opens the full-screen browser; a query or any flag below gives
+      plain output. Wi-Fi passwords excluded; custom names show `Name (website)`.
+        -s, --show-passwords      reveal passwords in the plain listing
+        --plain                   plain text instead of the full-screen browser
+        --copy-pw                 copy the matched login's password to clipboard
+        --copy-otp                copy its current verification code to clipboard
+        --copy-username           copy its username to clipboard
+        --get-pw                  print ONLY the password (for scripts)
+        --get-otp                 print ONLY the current verification code
+        --get-username            print ONLY the username
+      copy/get flags need a query; several matches prompt you to pick one (and
+      abort cleanly in pipes). Clipboard falls back to the OSC 52 terminal
+      escape when no clipboard tool exists (e.g. over SSH).
+
+  icp sync
+      Refresh the snapshot from iCloud: re-downloads and decrypts everything
+      (new, changed, and deleted passwords all picked up). Needs the anisette
+      server; when the ~2-month token expires, re-run `icp login`.
+
+  icp logout [--wipe-device]
+      Delete the local session. --wipe-device also forgets this device's
+      identity (a future login then registers a new device and re-joins via
+      escrow). Keychain trust persists at Apple until you remove the device in
+      Settings > Apple ID on a real device.
+
+full-screen browser keys (icp show):
+  type to filter   up/down move   Enter reveal password   Ctrl+P copy password
+  Ctrl+U copy username   Ctrl+O copy code and quit   / clear query
+  ? psono (work) lookup - searches psoco-cli with whatever is already typed,
+    shows the password and copies it (OSC 52 when remote)
+  Esc clear query, or quit when the query is empty (kitty popups map Esc to
+  close-window, so '/' is the clearer that always works)
+
 examples:
-  icp show                          full-screen browser (Ctrl+Y copy pw, Ctrl+O copy code)
-  icp show github                   plain list of matches
-  icp show github --copy-pw         copy the matched password to the clipboard
-  icp show github --get-otp         print only the current code (for scripts)
+  icp show                                full-screen browser
+  icp show github                         plain list of matches
+  icp show github -s                      plain list, passwords visible
+  icp show github --copy-pw               copy the matched password
+  icp show github --copy-otp              copy the current code
+  icp show github --copy-username         copy the username
+  icp show github --get-pw                print only the password (scripts)
+  icp sync                                refresh from iCloud
+  icp login -u steven@duz.ie              sign in as a specific Apple ID
+  icp logout --wipe-device                sign out and forget this device
 
 files:
-  ~/.config/icp/                    encrypted vault, session, device identity
+  ~/.config/icp/                          encrypted vault, session, device identity
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--anisette", metavar="URL",
@@ -880,8 +1165,11 @@ files:
     sp = sub.add_parser(
         "show", help="browse/search passwords, aliases, and account status",
         description=("With no arguments and a terminal: a full-screen browser - type to "
-                     "filter, up/down to move, Enter to reveal a password, Ctrl+Y to "
-                     "copy it, Ctrl+O to copy the current verification code, Esc to "
+                     "filter, up/down to move, Enter to reveal a password, Ctrl+P to "
+                     "copy it, Ctrl+U to copy the username, Ctrl+O to copy the "
+                     "current verification code and quit (fetching a code is the "
+                     "last step of a login workflow), '/' to clear the query, "
+                     "'?' for a psono (work password store) lookup, Esc to "
                      "clear/quit. With a query or any copy/get flag: plain output. "
                      "Wi-Fi (AirPort) passwords are excluded; entries named in the "
                      "Passwords app show as `Name (website)`. Works fully offline. "
@@ -931,7 +1219,7 @@ files:
                          "creates a new device and re-joins via escrow)")
     op.set_defaults(func=cmd_logout)
 
-    args = p.parse_args(argv)
+    args = p.parse_args(_normalize_argv(argv))
     try:
         return args.func(args)
     except KeyboardInterrupt:
